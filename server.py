@@ -7,6 +7,7 @@ import argparse
 import datetime
 import atexit
 import subprocess
+import json
 
 # Global variable to hold the current session
 current_session = None
@@ -413,19 +414,29 @@ def add_transaction(
     amount: float,
     description: str,
     date: str = None,
-    memo: str = None
+    memo: str = None,
+    dest_amount: float = None
 ) -> str:
     """
     Create a new transaction transferring money between two accounts.
     This creates a balanced double-entry transaction with two splits.
 
+    Supports multi-currency transactions: when the source and destination accounts
+    use different currencies, provide dest_amount to specify the amount in the
+    destination account's currency. The transaction currency is the source account's
+    currency. SetValue on both splits balances in the transaction currency, while
+    SetAmount on each split reflects the account's native currency.
+
     Args:
         from_account: The source account name (money flows out of this account).
         to_account: The destination account name (money flows into this account).
-        amount: The amount to transfer (positive number).
+        amount: The amount to transfer in the source account's currency (positive number).
         description: The transaction description/payee.
         date: Optional date in YYYY-MM-DD format (defaults to today).
         memo: Optional memo for the splits.
+        dest_amount: The amount in the destination account's currency (required when
+                     accounts use different currencies, e.g., transferring 100 USD
+                     to a EUR account where dest_amount=92.50 means 92.50 EUR received).
     """
     global current_session
 
@@ -434,6 +445,9 @@ def add_transaction(
 
     if amount <= 0:
         return "Error: Amount must be a positive number."
+
+    if dest_amount is not None and dest_amount <= 0:
+        return "Error: dest_amount must be a positive number."
 
     try:
         book = current_session.book
@@ -453,10 +467,20 @@ def add_transaction(
         if not commodity:
             return "Error: Source account has no currency/commodity set."
 
-        # Verify both accounts use the same currency (for simplicity)
         dest_commodity = dest_account.GetCommodity()
-        if dest_commodity and commodity.get_mnemonic() != dest_commodity.get_mnemonic():
-            return f"Error: Account currencies don't match ({commodity.get_mnemonic()} vs {dest_commodity.get_mnemonic()}). Multi-currency transactions are not supported."
+        if not dest_commodity:
+            return "Error: Destination account has no currency/commodity set."
+
+        src_currency = commodity.get_mnemonic()
+        dst_currency = dest_commodity.get_mnemonic()
+        multi_currency = src_currency != dst_currency
+
+        # Validate multi-currency parameters
+        if multi_currency and dest_amount is None:
+            return (
+                f"Error: Accounts use different currencies ({src_currency} vs {dst_currency}). "
+                f"Provide dest_amount to specify the amount in {dst_currency}."
+            )
 
         # Parse the date
         if date:
@@ -467,10 +491,10 @@ def add_transaction(
         else:
             tx_date = datetime.datetime.now()
 
-        # Convert amount to GncNumeric
-        # GnuCash uses fractions - currency.get_fraction() gives the denominator (e.g., 100 for USD)
-        fraction = commodity.get_fraction()
-        amount_int = round(amount * fraction)
+        # Convert amounts to GncNumeric
+        # Transaction currency is always the source account's currency
+        src_fraction = commodity.get_fraction()
+        src_amount_int = round(amount * src_fraction)
 
         # Create the transaction
         tx = Transaction(book)
@@ -481,29 +505,68 @@ def add_transaction(
         tx.SetDateEnteredSecs(datetime.datetime.now())
         tx.SetDatePostedSecs(tx_date)
 
-        # Create the source split (negative - money leaving)
-        split_from = Split(book)
-        split_from.SetParent(tx)
-        split_from.SetAccount(source_account)
-        split_from.SetValue(GncNumeric(-amount_int, fraction))
-        split_from.SetAmount(GncNumeric(-amount_int, fraction))
-        if memo:
-            split_from.SetMemo(memo)
+        if multi_currency:
+            # Multi-currency: SetValue uses transaction currency (source),
+            # SetAmount uses each account's native currency
+            dst_fraction = dest_commodity.get_fraction()
+            dst_amount_int = round(dest_amount * dst_fraction)
 
-        # Create the destination split (positive - money entering)
-        split_to = Split(book)
-        split_to.SetParent(tx)
-        split_to.SetAccount(dest_account)
-        split_to.SetValue(GncNumeric(amount_int, fraction))
-        split_to.SetAmount(GncNumeric(amount_int, fraction))
-        if memo:
-            split_to.SetMemo(memo)
+            # Source split: value and amount both in source currency
+            split_from = Split(book)
+            split_from.SetParent(tx)
+            split_from.SetAccount(source_account)
+            split_from.SetValue(GncNumeric(-src_amount_int, src_fraction))
+            split_from.SetAmount(GncNumeric(-src_amount_int, src_fraction))
+            if memo:
+                split_from.SetMemo(memo)
+
+            # Dest split: value in transaction currency (source), amount in dest currency
+            split_to = Split(book)
+            split_to.SetParent(tx)
+            split_to.SetAccount(dest_account)
+            split_to.SetValue(GncNumeric(src_amount_int, src_fraction))
+            split_to.SetAmount(GncNumeric(dst_amount_int, dst_fraction))
+            if memo:
+                split_to.SetMemo(memo)
+        else:
+            # Same currency: value == amount on both splits
+            split_from = Split(book)
+            split_from.SetParent(tx)
+            split_from.SetAccount(source_account)
+            split_from.SetValue(GncNumeric(-src_amount_int, src_fraction))
+            split_from.SetAmount(GncNumeric(-src_amount_int, src_fraction))
+            if memo:
+                split_from.SetMemo(memo)
+
+            split_to = Split(book)
+            split_to.SetParent(tx)
+            split_to.SetAccount(dest_account)
+            split_to.SetValue(GncNumeric(src_amount_int, src_fraction))
+            split_to.SetAmount(GncNumeric(src_amount_int, src_fraction))
+            if memo:
+                split_to.SetMemo(memo)
 
         # Commit the transaction - GnuCash will validate it's balanced
         tx.CommitEdit()
 
-        currency_symbol = commodity.get_mnemonic()
-        return f"Transaction created successfully:\n  {amount:.2f} {currency_symbol} from {source_account.get_full_name()} to {dest_account.get_full_name()}\n  Description: {description}\n  Date: {tx_date.strftime('%Y-%m-%d')}\n\nNote: Use save_file to persist changes to disk."
+        if multi_currency:
+            return (
+                f"Transaction created successfully:\n"
+                f"  {amount:.2f} {src_currency} from {source_account.get_full_name()}\n"
+                f"  {dest_amount:.2f} {dst_currency} to {dest_account.get_full_name()}\n"
+                f"  Description: {description}\n"
+                f"  Date: {tx_date.strftime('%Y-%m-%d')}\n\n"
+                f"Note: Use commit to persist changes to disk."
+            )
+        else:
+            return (
+                f"Transaction created successfully:\n"
+                f"  {amount:.2f} {src_currency} from {source_account.get_full_name()} "
+                f"to {dest_account.get_full_name()}\n"
+                f"  Description: {description}\n"
+                f"  Date: {tx_date.strftime('%Y-%m-%d')}\n\n"
+                f"Note: Use commit to persist changes to disk."
+            )
 
     except Exception as e:
         return f"Error creating transaction: {str(e)}"
@@ -525,6 +588,60 @@ def commit() -> str:
         return "Changes committed successfully."
     except Exception as e:
         return f"Error committing changes: {str(e)}"
+
+
+def _get_mapping_path() -> str:
+    """Return the path to account_mapping.json next to server.py."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "account_mapping.json")
+
+
+def _load_mappings() -> dict:
+    """Load account mappings from JSON file."""
+    path = _get_mapping_path()
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data.get("mappings", {})
+
+
+def _save_mappings(mappings: dict) -> None:
+    """Save account mappings to JSON file."""
+    path = _get_mapping_path()
+    data = {"mappings": mappings}
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def get_account_mapping() -> str:
+    """
+    Get the beancount-to-GNUCash account name mapping.
+    Returns all configured mappings from beancount account names (colon-separated,
+    e.g., "Expenses:Food:Groceries") to GNUCash account names (dot-separated,
+    e.g., "Expenses.Food.Groceries").
+    """
+    mappings = _load_mappings()
+    if not mappings:
+        return "No account mappings configured. Use add_account_mapping to add mappings."
+    lines = [f"  {bc} -> {gc}" for bc, gc in sorted(mappings.items())]
+    return f"Account mappings ({len(mappings)}):\n" + "\n".join(lines)
+
+
+def add_account_mapping(beancount_name: str, gnucash_name: str) -> str:
+    """
+    Add or update a beancount-to-GNUCash account name mapping.
+
+    Args:
+        beancount_name: The beancount account name (colon-separated, e.g., "Expenses:Food:Groceries").
+        gnucash_name: The GNUCash account name (dot-separated, e.g., "Expenses.Food.Groceries").
+    """
+    mappings = _load_mappings()
+    existed = beancount_name in mappings
+    mappings[beancount_name] = gnucash_name
+    _save_mappings(mappings)
+    action = "Updated" if existed else "Added"
+    return f"{action} mapping: {beancount_name} -> {gnucash_name}"
 
 
 def main():
@@ -592,14 +709,19 @@ def main():
     mcp.tool()(get_transactions)
     mcp.tool()(search_accounts)
     mcp.tool()(get_account_info)
+    mcp.tool()(get_account_mapping)
 
     # Register write tools only in write mode
     if write_mode:
+        mcp.tool()(add_account_mapping)
         mcp.tool(
             description="[WRITE MODE ENABLED] Create a new transaction transferring money between two accounts. "
             "This creates a balanced double-entry transaction with two splits. "
+            "Supports multi-currency: provide dest_amount when source and destination use different currencies. "
             "Args: from_account (source account), to_account (destination account), "
-            "amount (positive number), description (payee), date (optional, YYYY-MM-DD), memo (optional)."
+            "amount (positive number in source currency), description (payee), "
+            "date (optional, YYYY-MM-DD), memo (optional), "
+            "dest_amount (optional, amount in destination currency - required for multi-currency)."
         )(add_transaction)
         mcp.tool(
             description="[WRITE MODE ENABLED] Save pending changes to the GnuCash file immediately. "

@@ -35,11 +35,13 @@ Single-file MCP server (`server.py`) using FastMCP framework:
 - **Auto-open**: File opens automatically on startup from `GNUCASH_FILE` env var (required)
 - **Stale lock handling**: Automatically removes stale `.LCK` files if GnuCash app is not running
 - **Auto-save on exit**: In write mode, changes are saved automatically when session ends
-- **Read tools**: `list_accounts`, `get_account_balance`, `get_transactions`, `search_accounts`, `get_account_info`
-- **Write tools** (require `--write` flag): `add_transaction`, `commit`
+- **Read tools**: `list_accounts`, `get_account_balance`, `get_transactions`, `search_accounts`, `get_account_info`, `get_account_mapping`
+- **Write tools** (require `--write` flag): `add_transaction`, `commit`, `add_account_mapping`
 - **Account matching**: Supports exact match, suffix match (dot notation), and case-insensitive partial match
 - **Balance conversion**: GncNumeric values converted via `num()/denom()` to floats
 - **Transaction validation**: GnuCash Python bindings enforce double-entry bookkeeping - transactions must balance
+- **Multi-currency**: `add_transaction` supports transfers between accounts with different currencies via `dest_amount` parameter
+- **Account mapping**: `account_mapping.json` stores beancount→GNUCash account name mappings for sync workflows
 
 ## Key Constraints
 
@@ -48,4 +50,3 @@ Single-file MCP server (`server.py`) using FastMCP framework:
 - **Write mode optional**: Use `--write` flag to enable `SESSION_NORMAL_OPEN` and write tools
 - **System dependency**: Requires `python3-gnucash` package installed via system package manager
 - **No uvx/pipx**: Must use `--system-site-packages` venv to access gnucash bindings
-- **Same-currency transactions**: `add_transaction` only supports transactions between accounts with the same currency

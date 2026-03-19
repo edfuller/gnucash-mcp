@@ -1,0 +1,4 @@
+{
+  "mappings": {},
+  "_comment": "Maps beancount account names (colon-separated) to GNUCash account names (dot-separated). Example: \"Expenses:Food:Groceries\" -> \"Expenses.Food.Groceries\""
+}
