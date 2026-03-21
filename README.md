@@ -100,13 +100,15 @@ For write mode, add `"--write"` to the args array.
 | `get_transactions(account_name, limit)` | Get recent transactions (default: 20). |
 | `search_accounts(query)` | Search accounts by name (case-insensitive). |
 | `get_account_info(account_name)` | Get detailed account information. |
+| `get_account_mapping()` | Get the beancount→GNUCash account name mapping. |
 
 ### Write Tools (require `--write` flag)
 
 | Tool | Description |
 |------|-------------|
-| `add_transaction(from_account, to_account, amount, description, date, memo)` | Create a transaction between two accounts. |
+| `add_transaction(from_account, to_account, amount, description, date, memo, dest_amount)` | Create a transaction between two accounts. Supports multi-currency via `dest_amount`. |
 | `commit()` | Save pending changes to disk (also auto-saves on exit). |
+| `add_account_mapping(beancount_name, gnucash_name)` | Add/update a beancount→GNUCash account name mapping. |
 
 ### Account Names
 
@@ -123,6 +125,27 @@ Partial matching works:
 - "List all expense accounts"
 - "Search for accounts containing 'utilities'"
 - "Transfer $50 from checking to savings" (write mode)
+- "Transfer $100 USD to my EUR savings account" (multi-currency, write mode)
+
+## Multi-Currency Transactions
+
+When transferring between accounts with different currencies, provide `dest_amount`:
+
+```
+add_transaction(
+    from_account="Assets.Current Assets.Checking",
+    to_account="Assets.Savings.EUR Savings",
+    amount=100.00,        # 100 USD leaving source
+    dest_amount=92.50,    # 92.50 EUR arriving at destination
+    description="Transfer to EUR savings"
+)
+```
+
+The transaction currency is the source account's currency. `SetValue` on both splits balances in the transaction currency, while `SetAmount` reflects each account's native currency.
+
+## Account Mapping
+
+For beancount-bot-tg sync workflows, account mappings translate beancount names (colon-separated) to GNUCash names (dot-separated). Mappings are stored in `account_mapping.json`.
 
 ## Troubleshooting
 
@@ -150,7 +173,7 @@ These tools create isolated environments without access to system packages. The 
 
 - **System dependency**: Requires GnuCash installed system-wide
 - **Single file**: One file open at a time
-- **Same-currency transactions**: Write mode only supports transactions between accounts with the same currency
+- **Multi-currency requires dest_amount**: When accounts have different currencies, you must provide `dest_amount`
 
 ## License
 

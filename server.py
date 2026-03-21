@@ -1,198 +1,114 @@
 from mcp.server.fastmcp import FastMCP
-import gnucash
-from gnucash import Session, SessionOpenMode, GncNumeric, Transaction, Split
+import sqlite3
+import uuid
 import sys
 import os
-import argparse
 import datetime
-import atexit
-import subprocess
+import json
 
-# Global variable to hold the current session
-current_session = None
-
-# Write mode flag - controls whether write operations are allowed
-write_mode = False
+# Global SQLite connection
+conn = None
 
 # Configured file path from environment
 configured_file = None
 
-# MCP server instance - created in main() with appropriate name based on mode
-mcp = None
+# MCP server instance
+mcp = FastMCP("gnucash-mcp")
 
 
-def get_no_file_error() -> str:
-    """Return error message for when no file is open, including configured path if available."""
-    if configured_file:
-        return f"Error: No GnuCash file is open. Use open_file with path: {configured_file}"
-    return "Error: No GnuCash file is open. Use open_file to open a file first."
+def generate_guid():
+    """Generate a 32-char hex GUID matching GnuCash format."""
+    return uuid.uuid4().hex
 
 
-def is_gnucash_running() -> bool:
-    """Check if GnuCash application is currently running."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-x", "gnucash"],
-            capture_output=True,
-            timeout=5
-        )
-        return result.returncode == 0
-    except Exception:
-        return False  # Assume not running if we can't check
+def build_account_tree(db):
+    """Load all accounts and compute full dot-separated names."""
+    rows = db.execute(
+        "SELECT guid, name, account_type, commodity_guid, parent_guid, "
+        "description, code, hidden, placeholder, commodity_scu FROM accounts"
+    ).fetchall()
+
+    by_guid = {}
+    for r in rows:
+        by_guid[r[0]] = {
+            "guid": r[0],
+            "name": r[1],
+            "account_type": r[2],
+            "commodity_guid": r[3],
+            "parent_guid": r[4],
+            "description": r[5],
+            "code": r[6],
+            "hidden": r[7],
+            "placeholder": r[8],
+            "commodity_scu": r[9],
+        }
+
+    def full_name(guid):
+        parts = []
+        current = guid
+        while current and current in by_guid:
+            acc = by_guid[current]
+            if acc["account_type"] == "ROOT":
+                break
+            parts.append(acc["name"])
+            current = acc["parent_guid"]
+        parts.reverse()
+        return ".".join(parts)
+
+    result = {}
+    for guid, acc in by_guid.items():
+        if acc["account_type"] == "ROOT":
+            continue
+        acc["full_name"] = full_name(guid)
+        result[guid] = acc
+
+    return result
 
 
-def remove_stale_lock(file_path: str) -> bool:
+def find_account_guid(db, name):
     """
-    Remove stale lock file if GnuCash is not running.
-    Returns True if lock was removed or didn't exist, False if GnuCash is running.
+    Find an account by name using 3-tier matching: exact, suffix, partial.
+    Returns (guid, full_name) or (None, None).
     """
-    lock_path = file_path + ".LCK"
-    if not os.path.exists(lock_path):
-        return True
+    tree = build_account_tree(db)
 
-    if is_gnucash_running():
-        return False  # Don't remove lock if GnuCash is running
+    # Exact match
+    for guid, acc in tree.items():
+        if acc["full_name"] == name:
+            return guid, acc["full_name"]
 
-    try:
-        os.remove(lock_path)
-        print(f"Removed stale lock file: {lock_path}", file=sys.stderr)
-        return True
-    except Exception as e:
-        print(f"Failed to remove lock file: {e}", file=sys.stderr)
-        return False
+    # Suffix match
+    for guid, acc in tree.items():
+        if acc["full_name"].endswith("." + name):
+            return guid, acc["full_name"]
 
+    # Case-insensitive partial match
+    name_lower = name.lower()
+    for guid, acc in tree.items():
+        if name_lower in acc["full_name"].lower():
+            return guid, acc["full_name"]
 
-def cleanup_session():
-    """Save changes and clean up the GnuCash session on exit."""
-    global current_session
-    if current_session:
-        try:
-            # Auto-save if in write mode
-            if write_mode:
-                current_session.save()
-                print("Changes saved automatically on exit.", file=sys.stderr)
-            current_session.end()
-            print("GnuCash session closed (lock released).", file=sys.stderr)
-        except Exception as e:
-            print(f"Error during cleanup: {e}", file=sys.stderr)
-        current_session = None
+    return None, None
 
 
-# Register cleanup handler
-atexit.register(cleanup_session)
-
-
-def find_account(root, account_name: str):
-    """
-    Find an account by name using exact match, suffix match, or partial match.
-    Returns the account object or None if not found.
-    """
-    # Try exact match or suffix match first
-    for acc in root.get_descendants():
-        full_name = acc.get_full_name()
-        if full_name == account_name or full_name.endswith("." + account_name):
-            return acc
-
-    # Try case-insensitive partial match
-    account_lower = account_name.lower()
-    for acc in root.get_descendants():
-        if account_lower in acc.get_full_name().lower():
-            return acc
-
-    return None
-
-
-def get_account_type_name(type_code: int) -> str:
-    """Convert GnuCash account type code to human-readable name."""
-    type_map = {
-        0: "BANK",
-        1: "CASH",
-        2: "ASSET",
-        3: "CREDIT",
-        4: "LIABILITY",
-        5: "STOCK",
-        6: "MUTUAL",
-        7: "CURRENCY",
-        8: "INCOME",
-        9: "EXPENSE",
-        10: "EQUITY",
-        11: "RECEIVABLE",
-        12: "PAYABLE",
-        13: "ROOT",
-        14: "TRADING",
-    }
-    return type_map.get(type_code, f"UNKNOWN({type_code})")
-
-
-def open_file(file_path: str, break_lock: bool = False) -> str:
-    """
-    Open a GnuCash file (.gnucash). Supports both XML (compressed or uncompressed) and SQLite formats.
-
-    Args:
-        file_path: The absolute path to the GnuCash file.
-        break_lock: If True, remove stale lock file before opening (only if GnuCash app is not running).
-    """
-    global current_session
-    try:
-        # Close existing session if any
-        if current_session:
-            current_session.end()
-            current_session = None
-
-        if not os.path.exists(file_path):
-            return f"Error: File not found: {file_path}"
-
-        # Handle lock breaking if requested
-        if break_lock:
-            lock_path = file_path + ".LCK"
-            if os.path.exists(lock_path):
-                if is_gnucash_running():
-                    return "Error: Cannot break lock - GnuCash application is currently running. Close GnuCash first."
-                remove_stale_lock(file_path)
-
-        # Use SESSION_NORMAL_OPEN for write mode, SESSION_READ_ONLY otherwise
-        if write_mode:
-            current_session = Session(file_path, SessionOpenMode.SESSION_NORMAL_OPEN)
-            return f"Successfully opened GnuCash file (read-write): {file_path}"
-        else:
-            current_session = Session(file_path, SessionOpenMode.SESSION_READ_ONLY)
-            return f"Successfully opened GnuCash file (read-only): {file_path}"
-    except Exception as e:
-        error_msg = str(e)
-        if "LOCKED" in error_msg.upper():
-            return f"Error opening file: {error_msg}. Try with break_lock=True if GnuCash is not running."
-        return f"Error opening file: {error_msg}"
-
-
-def close_file() -> str:
-    """
-    Close the currently open GnuCash file.
-    """
-    global current_session
-    if current_session:
-        current_session.end()
-        current_session = None
-        return "File closed successfully."
-    return "No file is currently open."
+def get_commodity_info(db, commodity_guid):
+    """Get commodity mnemonic and fraction for a given guid."""
+    row = db.execute(
+        "SELECT mnemonic, fraction FROM commodities WHERE guid = ?",
+        (commodity_guid,)
+    ).fetchone()
+    if row:
+        return row[0], row[1]
+    return "?", 100
 
 
 def list_accounts() -> str:
     """
-    List all accounts in the currently open GnuCash file with their types.
+    List all accounts in the GnuCash file with their types.
     """
-    global current_session
-    if not current_session:
-        return get_no_file_error()
-
     try:
-        book = current_session.book
-        root = book.get_root_account()
-
-        accounts = []
-        for acc in root.get_descendants():
-            type_name = get_account_type_name(acc.GetType())
-            accounts.append(f"{acc.get_full_name()} ({type_name})")
-
+        tree = build_account_tree(conn)
+        accounts = [f"{acc['full_name']} ({acc['account_type']})" for acc in tree.values()]
         return "\n".join(sorted(accounts))
     except Exception as e:
         return f"Error listing accounts: {str(e)}"
@@ -203,44 +119,25 @@ def get_account_balance(account_name: str) -> str:
     Get the balance of a specific account.
 
     Args:
-        account_name: The full name of the account (e.g., "Assets.Current Assets.Current Account")
+        account_name: The full name of the account (e.g., "Assets.Current Assets.Checking Account")
                       or a partial name to search for.
     """
-    global current_session
-    if not current_session:
-        return get_no_file_error()
-
     try:
-        book = current_session.book
-        root = book.get_root_account()
-
-        # Search for account by full name or partial match
-        target_account = None
-        for acc in root.get_descendants():
-            full_name = acc.get_full_name()
-            if full_name == account_name or full_name.endswith(account_name):
-                target_account = acc
-                break
-
-        if not target_account:
-            # Try case-insensitive partial match
-            account_lower = account_name.lower()
-            for acc in root.get_descendants():
-                if account_lower in acc.get_full_name().lower():
-                    target_account = acc
-                    break
-
-        if not target_account:
+        guid, full_name = find_account_guid(conn, account_name)
+        if not guid:
             return f"Error: Account '{account_name}' not found."
 
-        balance = target_account.GetBalance()
-        commodity = target_account.GetCommodity()
-        currency = commodity.get_mnemonic() if commodity else "?"
+        tree = build_account_tree(conn)
+        acc = tree[guid]
+        mnemonic, fraction = get_commodity_info(conn, acc["commodity_guid"])
 
-        # Convert GncNumeric to decimal
-        balance_decimal = float(balance.num()) / float(balance.denom())
+        row = conn.execute(
+            "SELECT COALESCE(SUM(quantity_num), 0) FROM splits WHERE account_guid = ?",
+            (guid,)
+        ).fetchone()
+        balance = row[0] / fraction
 
-        return f"Balance of {target_account.get_full_name()}: {balance_decimal:.2f} {currency}"
+        return f"Balance of {full_name}: {balance:.2f} {mnemonic}"
     except Exception as e:
         return f"Error getting balance: {str(e)}"
 
@@ -253,50 +150,35 @@ def get_transactions(account_name: str, limit: int = 20) -> str:
         account_name: The full name of the account or a partial name to search for.
         limit: Maximum number of transactions to return (default 20).
     """
-    global current_session
-    if not current_session:
-        return get_no_file_error()
-
     try:
-        book = current_session.book
-        root = book.get_root_account()
-
-        # Search for account
-        target_account = None
-        for acc in root.get_descendants():
-            full_name = acc.get_full_name()
-            if full_name == account_name or full_name.endswith(account_name):
-                target_account = acc
-                break
-
-        if not target_account:
-            account_lower = account_name.lower()
-            for acc in root.get_descendants():
-                if account_lower in acc.get_full_name().lower():
-                    target_account = acc
-                    break
-
-        if not target_account:
+        guid, full_name = find_account_guid(conn, account_name)
+        if not guid:
             return f"Error: Account '{account_name}' not found."
 
-        splits = target_account.GetSplitList()
-        if not splits:
-            return f"No transactions found for {target_account.get_full_name()}."
+        tree = build_account_tree(conn)
+        acc = tree[guid]
+        mnemonic, fraction = get_commodity_info(conn, acc["commodity_guid"])
+
+        rows = conn.execute(
+            "SELECT t.post_date, s.value_num, s.value_denom, t.description "
+            "FROM splits s JOIN transactions t ON s.tx_guid = t.guid "
+            "WHERE s.account_guid = ? ORDER BY t.post_date DESC LIMIT ?",
+            (guid, limit)
+        ).fetchall()
+
+        if not rows:
+            return f"No transactions found for {full_name}."
+
+        # Reverse so oldest first (matching original behavior)
+        rows = list(reversed(rows))
 
         transactions = []
-        for split in splits[-limit:]:  # Get last N splits
-            trans = split.parent
-            date = trans.GetDate().strftime("%Y-%m-%d")
-            desc = trans.GetDescription()
-            value = split.GetValue()
-            value_decimal = float(value.num()) / float(value.denom())
+        for post_date, value_num, value_denom, description in rows:
+            date_str = post_date[:10] if post_date else "????-??-??"
+            value = value_num / value_denom if value_denom else 0
+            transactions.append(f"{date_str} | {value:>10.2f} {mnemonic} | {description}")
 
-            commodity = target_account.GetCommodity()
-            currency = commodity.get_mnemonic() if commodity else "?"
-
-            transactions.append(f"{date} | {value_decimal:>10.2f} {currency} | {desc}")
-
-        header = f"Transactions for {target_account.get_full_name()}:\n"
+        header = f"Transactions for {full_name}:\n"
         header += "-" * 60 + "\n"
         return header + "\n".join(transactions)
     except Exception as e:
@@ -310,21 +192,13 @@ def search_accounts(query: str) -> str:
     Args:
         query: Search string to match against account names.
     """
-    global current_session
-    if not current_session:
-        return get_no_file_error()
-
     try:
-        book = current_session.book
-        root = book.get_root_account()
-
+        tree = build_account_tree(conn)
         query_lower = query.lower()
         matches = []
-        for acc in root.get_descendants():
-            full_name = acc.get_full_name()
-            if query_lower in full_name.lower():
-                type_name = get_account_type_name(acc.GetType())
-                matches.append(f"{full_name} ({type_name})")
+        for acc in tree.values():
+            if query_lower in acc["full_name"].lower():
+                matches.append(f"{acc['full_name']} ({acc['account_type']})")
 
         if not matches:
             return f"No accounts found matching '{query}'."
@@ -341,64 +215,62 @@ def get_account_info(account_name: str) -> str:
     Args:
         account_name: The full name of the account or a partial name to search for.
     """
-    global current_session
-    if not current_session:
-        return get_no_file_error()
-
     try:
-        book = current_session.book
-        root = book.get_root_account()
-
-        # Search for account
-        target_account = None
-        for acc in root.get_descendants():
-            full_name = acc.get_full_name()
-            if full_name == account_name or full_name.endswith(account_name):
-                target_account = acc
-                break
-
-        if not target_account:
-            account_lower = account_name.lower()
-            for acc in root.get_descendants():
-                if account_lower in acc.get_full_name().lower():
-                    target_account = acc
-                    break
-
-        if not target_account:
+        guid, full_name = find_account_guid(conn, account_name)
+        if not guid:
             return f"Error: Account '{account_name}' not found."
 
-        # Gather account info
-        full_name = target_account.get_full_name()
-        type_name = get_account_type_name(target_account.GetType())
-        description = target_account.GetDescription() or "(none)"
-        code = target_account.GetCode() or "(none)"
+        tree = build_account_tree(conn)
+        acc = tree[guid]
+        mnemonic, fraction = get_commodity_info(conn, acc["commodity_guid"])
 
-        commodity = target_account.GetCommodity()
-        currency = commodity.get_mnemonic() if commodity else "?"
+        # Balance
+        row = conn.execute(
+            "SELECT COALESCE(SUM(quantity_num), 0) FROM splits WHERE account_guid = ?",
+            (guid,)
+        ).fetchone()
+        balance = row[0] / fraction
 
-        balance = target_account.GetBalance()
-        balance_decimal = float(balance.num()) / float(balance.denom())
+        # Cleared balance (reconcile_state = 'c' or 'y')
+        row = conn.execute(
+            "SELECT COALESCE(SUM(quantity_num), 0) FROM splits "
+            "WHERE account_guid = ? AND reconcile_state IN ('c', 'y')",
+            (guid,)
+        ).fetchone()
+        cleared = row[0] / fraction
 
-        cleared_balance = target_account.GetClearedBalance()
-        cleared_decimal = float(cleared_balance.num()) / float(cleared_balance.denom())
+        # Reconciled balance (reconcile_state = 'y')
+        row = conn.execute(
+            "SELECT COALESCE(SUM(quantity_num), 0) FROM splits "
+            "WHERE account_guid = ? AND reconcile_state = 'y'",
+            (guid,)
+        ).fetchone()
+        reconciled = row[0] / fraction
 
-        reconciled_balance = target_account.GetReconciledBalance()
-        reconciled_decimal = float(reconciled_balance.num()) / float(reconciled_balance.denom())
+        # Split count
+        row = conn.execute(
+            "SELECT COUNT(*) FROM splits WHERE account_guid = ?", (guid,)
+        ).fetchone()
+        num_splits = row[0]
 
-        num_splits = len(target_account.GetSplitList())
+        # Children
+        children_rows = conn.execute(
+            "SELECT name FROM accounts WHERE parent_guid = ? AND account_type != 'ROOT'",
+            (guid,)
+        ).fetchall()
+        children_str = ", ".join(r[0] for r in children_rows) if children_rows else "(none)"
 
-        # Get children
-        children = [child.name for child in target_account.get_children()]
-        children_str = ", ".join(children) if children else "(none)"
+        description = acc["description"] or "(none)"
+        code = acc["code"] or "(none)"
 
         info = f"""Account: {full_name}
-Type: {type_name}
+Type: {acc['account_type']}
 Description: {description}
 Code: {code}
-Currency: {currency}
-Balance: {balance_decimal:.2f} {currency}
-Cleared Balance: {cleared_decimal:.2f} {currency}
-Reconciled Balance: {reconciled_decimal:.2f} {currency}
+Currency: {mnemonic}
+Balance: {balance:.2f} {mnemonic}
+Cleared Balance: {cleared:.2f} {mnemonic}
+Reconciled Balance: {reconciled:.2f} {mnemonic}
 Number of Transactions: {num_splits}
 Child Accounts: {children_str}"""
 
@@ -407,204 +279,391 @@ Child Accounts: {children_str}"""
         return f"Error getting account info: {str(e)}"
 
 
+VALID_ACCOUNT_TYPES = {
+    "BANK", "CASH", "ASSET", "CREDIT", "LIABILITY",
+    "STOCK", "MUTUAL", "CURRENCY", "INCOME", "EXPENSE",
+    "EQUITY", "RECEIVABLE", "PAYABLE", "TRADING",
+}
+
+
+def create_account(
+    name: str,
+    account_type: str,
+    parent: str = None,
+    currency: str = None,
+    description: str = None,
+) -> str:
+    """
+    Create a new account in the GnuCash file.
+
+    Args:
+        name: The account name (e.g., "Groceries"). Do NOT include the parent path.
+        account_type: The account type. One of: BANK, CASH, ASSET, CREDIT, LIABILITY,
+                      STOCK, MUTUAL, CURRENCY, INCOME, EXPENSE, EQUITY, RECEIVABLE,
+                      PAYABLE, TRADING.
+        parent: Full name of the parent account (e.g., "Expenses.Food"). If omitted,
+                creates under the root account.
+        currency: ISO 4217 currency code (e.g., "USD", "EUR"). Defaults to the parent
+                  account's currency, or USD if no parent.
+        description: Optional description for the account.
+    """
+    account_type_upper = account_type.upper()
+    if account_type_upper not in VALID_ACCOUNT_TYPES:
+        return f"Error: Invalid account type '{account_type}'. Must be one of: {', '.join(sorted(VALID_ACCOUNT_TYPES))}"
+
+    try:
+        # Find parent
+        if parent:
+            parent_guid, parent_full = find_account_guid(conn, parent)
+            if not parent_guid:
+                return f"Error: Parent account '{parent}' not found."
+        else:
+            # Root account
+            row = conn.execute(
+                "SELECT guid FROM accounts WHERE account_type = 'ROOT'"
+            ).fetchone()
+            if not row:
+                return "Error: Root account not found."
+            parent_guid = row[0]
+
+        # Check if account already exists under this parent
+        existing = conn.execute(
+            "SELECT name FROM accounts WHERE parent_guid = ? AND name = ?",
+            (parent_guid, name)
+        ).fetchone()
+        if existing:
+            return f"Error: Account '{name}' already exists under the specified parent."
+
+        # Determine commodity
+        if currency:
+            commodity_row = conn.execute(
+                "SELECT guid, fraction FROM commodities WHERE namespace = 'CURRENCY' AND mnemonic = ?",
+                (currency.upper(),)
+            ).fetchone()
+            if not commodity_row:
+                return f"Error: Currency '{currency}' not found. Use an ISO 4217 code (e.g., USD, EUR)."
+            commodity_guid = commodity_row[0]
+            commodity_scu = commodity_row[1]
+        else:
+            # Inherit from parent
+            parent_row = conn.execute(
+                "SELECT commodity_guid, commodity_scu FROM accounts WHERE guid = ?",
+                (parent_guid,)
+            ).fetchone()
+            if parent_row and parent_row[0]:
+                commodity_guid = parent_row[0]
+                commodity_scu = parent_row[1]
+            else:
+                # Fallback to USD
+                usd_row = conn.execute(
+                    "SELECT guid, fraction FROM commodities WHERE namespace = 'CURRENCY' AND mnemonic = 'USD'"
+                ).fetchone()
+                if not usd_row:
+                    return "Error: Could not determine currency. Specify one explicitly."
+                commodity_guid = usd_row[0]
+                commodity_scu = usd_row[1]
+
+        new_guid = generate_guid()
+        conn.execute(
+            "INSERT INTO accounts (guid, name, account_type, commodity_guid, commodity_scu, "
+            "non_std_scu, parent_guid, code, description, hidden, placeholder) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, '', ?, 0, 0)",
+            (new_guid, name, account_type_upper, commodity_guid, commodity_scu,
+             parent_guid, description or "")
+        )
+        conn.commit()
+
+        # Build full name for display
+        tree = build_account_tree(conn)
+        full_name = tree[new_guid]["full_name"] if new_guid in tree else name
+        mnemonic, _ = get_commodity_info(conn, commodity_guid)
+
+        return (
+            f"Account created successfully:\n"
+            f"  Name: {full_name}\n"
+            f"  Type: {account_type_upper}\n"
+            f"  Currency: {mnemonic}"
+        )
+
+    except Exception as e:
+        return f"Error creating account: {str(e)}"
+
+
+def delete_account(account_name: str) -> str:
+    """
+    Delete an account from the GnuCash file.
+    The account must have no transactions and no child accounts.
+
+    Args:
+        account_name: The full name of the account (e.g., "Expenses.Food.Groceries")
+                      or a partial name to search for.
+    """
+    try:
+        guid, full_name = find_account_guid(conn, account_name)
+        if not guid:
+            return f"Error: Account '{account_name}' not found."
+
+        # Check for children
+        children = conn.execute(
+            "SELECT name FROM accounts WHERE parent_guid = ?", (guid,)
+        ).fetchall()
+        if children:
+            child_names = [r[0] for r in children]
+            return f"Error: Cannot delete '{full_name}' — it has child accounts: {', '.join(child_names)}"
+
+        # Check for splits
+        row = conn.execute(
+            "SELECT COUNT(*) FROM splits WHERE account_guid = ?", (guid,)
+        ).fetchone()
+        if row[0] > 0:
+            return f"Error: Cannot delete '{full_name}' — it has {row[0]} transaction(s). Remove them first."
+
+        # Delete any slots associated with this account
+        conn.execute("DELETE FROM slots WHERE obj_guid = ?", (guid,))
+        conn.execute("DELETE FROM accounts WHERE guid = ?", (guid,))
+        conn.commit()
+
+        return f"Account deleted: {full_name}"
+
+    except Exception as e:
+        return f"Error deleting account: {str(e)}"
+
+
 def add_transaction(
     from_account: str,
     to_account: str,
     amount: float,
     description: str,
     date: str = None,
-    memo: str = None
+    memo: str = None,
+    dest_amount: float = None
 ) -> str:
     """
     Create a new transaction transferring money between two accounts.
     This creates a balanced double-entry transaction with two splits.
 
+    Supports multi-currency transactions: when the source and destination accounts
+    use different currencies, provide dest_amount to specify the amount in the
+    destination account's currency.
+
     Args:
         from_account: The source account name (money flows out of this account).
         to_account: The destination account name (money flows into this account).
-        amount: The amount to transfer (positive number).
+        amount: The amount to transfer in the source account's currency (positive number).
         description: The transaction description/payee.
         date: Optional date in YYYY-MM-DD format (defaults to today).
         memo: Optional memo for the splits.
+        dest_amount: The amount in the destination account's currency (required when
+                     accounts use different currencies, e.g., transferring 100 USD
+                     to a EUR account where dest_amount=92.50 means 92.50 EUR received).
     """
-    global current_session
-
-    if not current_session:
-        return get_no_file_error()
-
     if amount <= 0:
         return "Error: Amount must be a positive number."
 
-    try:
-        book = current_session.book
-        root = book.get_root_account()
+    if dest_amount is not None and dest_amount <= 0:
+        return "Error: dest_amount must be a positive number."
 
-        # Find both accounts
-        source_account = find_account(root, from_account)
-        if not source_account:
+    try:
+        src_guid, src_full = find_account_guid(conn, from_account)
+        if not src_guid:
             return f"Error: Source account '{from_account}' not found."
 
-        dest_account = find_account(root, to_account)
-        if not dest_account:
+        dst_guid, dst_full = find_account_guid(conn, to_account)
+        if not dst_guid:
             return f"Error: Destination account '{to_account}' not found."
 
-        # Get the currency from the source account
-        commodity = source_account.GetCommodity()
-        if not commodity:
-            return "Error: Source account has no currency/commodity set."
+        tree = build_account_tree(conn)
+        src_acc = tree[src_guid]
+        dst_acc = tree[dst_guid]
 
-        # Verify both accounts use the same currency (for simplicity)
-        dest_commodity = dest_account.GetCommodity()
-        if dest_commodity and commodity.get_mnemonic() != dest_commodity.get_mnemonic():
-            return f"Error: Account currencies don't match ({commodity.get_mnemonic()} vs {dest_commodity.get_mnemonic()}). Multi-currency transactions are not supported."
+        src_mnemonic, src_fraction = get_commodity_info(conn, src_acc["commodity_guid"])
+        dst_mnemonic, dst_fraction = get_commodity_info(conn, dst_acc["commodity_guid"])
 
-        # Parse the date
+        multi_currency = src_acc["commodity_guid"] != dst_acc["commodity_guid"]
+
+        if multi_currency and dest_amount is None:
+            return (
+                f"Error: Accounts use different currencies ({src_mnemonic} vs {dst_mnemonic}). "
+                f"Provide dest_amount to specify the amount in {dst_mnemonic}."
+            )
+
+        # Parse date
         if date:
             try:
-                tx_date = datetime.datetime.strptime(date, "%Y-%m-%d")
+                datetime.datetime.strptime(date, "%Y-%m-%d")
             except ValueError:
                 return "Error: Invalid date format. Use YYYY-MM-DD."
+            post_date = date + " 00:00:00"
         else:
-            tx_date = datetime.datetime.now()
+            post_date = datetime.datetime.now().strftime("%Y-%m-%d") + " 00:00:00"
 
-        # Convert amount to GncNumeric
-        # GnuCash uses fractions - currency.get_fraction() gives the denominator (e.g., 100 for USD)
-        fraction = commodity.get_fraction()
-        amount_int = round(amount * fraction)
+        enter_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Create the transaction
-        tx = Transaction(book)
-        tx.BeginEdit()
+        # Compute amounts as num/denom
+        src_value_num = round(amount * src_fraction)
 
-        tx.SetCurrency(commodity)
-        tx.SetDescription(description)
-        tx.SetDateEnteredSecs(datetime.datetime.now())
-        tx.SetDatePostedSecs(tx_date)
+        tx_guid = generate_guid()
 
-        # Create the source split (negative - money leaving)
-        split_from = Split(book)
-        split_from.SetParent(tx)
-        split_from.SetAccount(source_account)
-        split_from.SetValue(GncNumeric(-amount_int, fraction))
-        split_from.SetAmount(GncNumeric(-amount_int, fraction))
-        if memo:
-            split_from.SetMemo(memo)
+        # Transaction currency is always the source account's currency
+        conn.execute(
+            "INSERT INTO transactions (guid, currency_guid, num, post_date, enter_date, description) "
+            "VALUES (?, ?, '', ?, ?, ?)",
+            (tx_guid, src_acc["commodity_guid"], post_date, enter_date, description)
+        )
 
-        # Create the destination split (positive - money entering)
-        split_to = Split(book)
-        split_to.SetParent(tx)
-        split_to.SetAccount(dest_account)
-        split_to.SetValue(GncNumeric(amount_int, fraction))
-        split_to.SetAmount(GncNumeric(amount_int, fraction))
-        if memo:
-            split_to.SetMemo(memo)
+        # Source split (money out — negative)
+        src_split_guid = generate_guid()
+        if multi_currency:
+            # value in transaction currency, quantity in account currency (same for source)
+            conn.execute(
+                "INSERT INTO splits (guid, tx_guid, account_guid, memo, action, "
+                "reconcile_state, reconcile_date, value_num, value_denom, "
+                "quantity_num, quantity_denom, lot_guid) "
+                "VALUES (?, ?, ?, ?, '', 'n', NULL, ?, ?, ?, ?, NULL)",
+                (src_split_guid, tx_guid, src_guid, memo or "",
+                 -src_value_num, src_fraction, -src_value_num, src_fraction)
+            )
 
-        # Commit the transaction - GnuCash will validate it's balanced
-        tx.CommitEdit()
+            # Dest split: value in transaction currency (source), quantity in dest currency
+            dst_quantity_num = round(dest_amount * dst_fraction)
+            dst_split_guid = generate_guid()
+            conn.execute(
+                "INSERT INTO splits (guid, tx_guid, account_guid, memo, action, "
+                "reconcile_state, reconcile_date, value_num, value_denom, "
+                "quantity_num, quantity_denom, lot_guid) "
+                "VALUES (?, ?, ?, ?, '', 'n', NULL, ?, ?, ?, ?, NULL)",
+                (dst_split_guid, tx_guid, dst_guid, memo or "",
+                 src_value_num, src_fraction, dst_quantity_num, dst_fraction)
+            )
+        else:
+            # Same currency: value == quantity on both splits
+            conn.execute(
+                "INSERT INTO splits (guid, tx_guid, account_guid, memo, action, "
+                "reconcile_state, reconcile_date, value_num, value_denom, "
+                "quantity_num, quantity_denom, lot_guid) "
+                "VALUES (?, ?, ?, ?, '', 'n', NULL, ?, ?, ?, ?, NULL)",
+                (src_split_guid, tx_guid, src_guid, memo or "",
+                 -src_value_num, src_fraction, -src_value_num, src_fraction)
+            )
 
-        currency_symbol = commodity.get_mnemonic()
-        return f"Transaction created successfully:\n  {amount:.2f} {currency_symbol} from {source_account.get_full_name()} to {dest_account.get_full_name()}\n  Description: {description}\n  Date: {tx_date.strftime('%Y-%m-%d')}\n\nNote: Use save_file to persist changes to disk."
+            dst_split_guid = generate_guid()
+            conn.execute(
+                "INSERT INTO splits (guid, tx_guid, account_guid, memo, action, "
+                "reconcile_state, reconcile_date, value_num, value_denom, "
+                "quantity_num, quantity_denom, lot_guid) "
+                "VALUES (?, ?, ?, ?, '', 'n', NULL, ?, ?, ?, ?, NULL)",
+                (dst_split_guid, tx_guid, dst_guid, memo or "",
+                 src_value_num, src_fraction, src_value_num, src_fraction)
+            )
+
+        conn.commit()
+
+        date_display = date or datetime.datetime.now().strftime("%Y-%m-%d")
+        if multi_currency:
+            return (
+                f"Transaction created successfully:\n"
+                f"  {amount:.2f} {src_mnemonic} from {src_full}\n"
+                f"  {dest_amount:.2f} {dst_mnemonic} to {dst_full}\n"
+                f"  Description: {description}\n"
+                f"  Date: {date_display}"
+            )
+        else:
+            return (
+                f"Transaction created successfully:\n"
+                f"  {amount:.2f} {src_mnemonic} from {src_full} to {dst_full}\n"
+                f"  Description: {description}\n"
+                f"  Date: {date_display}"
+            )
 
     except Exception as e:
         return f"Error creating transaction: {str(e)}"
 
 
-def commit() -> str:
-    """
-    Save all pending changes to the GnuCash file.
-    Call this after making modifications to persist them immediately.
-    Changes are also auto-saved when the session ends.
-    """
-    global current_session
+def _get_mapping_path() -> str:
+    """Return the path to account_mapping.json next to server.py."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "account_mapping.json")
 
-    if not current_session:
-        return get_no_file_error()
 
-    try:
-        current_session.save()
-        return "Changes committed successfully."
-    except Exception as e:
-        return f"Error committing changes: {str(e)}"
+def _load_mappings() -> dict:
+    """Load account mappings from JSON file."""
+    path = _get_mapping_path()
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data.get("mappings", {})
+
+
+def _save_mappings(mappings: dict) -> None:
+    """Save account mappings to JSON file."""
+    path = _get_mapping_path()
+    data = {"mappings": mappings}
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def get_account_mapping() -> str:
+    """
+    Get the beancount-to-GNUCash account name mapping.
+    Returns all configured mappings from beancount account names (colon-separated,
+    e.g., "Expenses:Food:Groceries") to GNUCash account names (dot-separated,
+    e.g., "Expenses.Food.Groceries").
+    """
+    mappings = _load_mappings()
+    if not mappings:
+        return "No account mappings configured. Use add_account_mapping to add mappings."
+    lines = [f"  {bc} -> {gc}" for bc, gc in sorted(mappings.items())]
+    return f"Account mappings ({len(mappings)}):\n" + "\n".join(lines)
+
+
+def add_account_mapping(beancount_name: str, gnucash_name: str) -> str:
+    """
+    Add or update a beancount-to-GNUCash account name mapping.
+
+    Args:
+        beancount_name: The beancount account name (colon-separated, e.g., "Expenses:Food:Groceries").
+        gnucash_name: The GNUCash account name (dot-separated, e.g., "Expenses.Food.Groceries").
+    """
+    mappings = _load_mappings()
+    existed = beancount_name in mappings
+    mappings[beancount_name] = gnucash_name
+    _save_mappings(mappings)
+    action = "Updated" if existed else "Added"
+    return f"{action} mapping: {beancount_name} -> {gnucash_name}"
 
 
 def main():
-    global write_mode, current_session, mcp, configured_file
+    global conn, configured_file
 
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="GnuCash MCP Server")
-    parser.add_argument(
-        "--write",
-        action="store_true",
-        help="Enable write mode (allows creating transactions and saving files)"
-    )
-    args = parser.parse_args()
-
-    write_mode = args.write
-
-    # Create MCP server with mode-aware name so clients know the server's capabilities
-    if write_mode:
-        mcp = FastMCP("gnucash-mcp (read-write)")
-        print("GnuCash MCP Server running on stdio (WRITE MODE ENABLED)...", file=sys.stderr)
-    else:
-        mcp = FastMCP("gnucash-mcp (read-only)")
-        print("GnuCash MCP Server running on stdio (read-only)...", file=sys.stderr)
-
-    # Auto-open file from GNUCASH_FILE environment variable
     env_file = os.environ.get("GNUCASH_FILE")
-
     if not env_file:
         print("Error: GNUCASH_FILE environment variable not set.", file=sys.stderr)
-        print("Configure with: claude mcp add gnucash ... -e GNUCASH_FILE=/path/to/file.gnucash", file=sys.stderr)
         sys.exit(1)
 
-    configured_file = env_file  # Store for error messages
+    configured_file = env_file
 
     if not os.path.exists(env_file):
         print(f"Error: GnuCash file not found: {env_file}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Opening GnuCash file: {env_file}", file=sys.stderr)
+    print(f"Opening GnuCash file (SQLite): {env_file}", file=sys.stderr)
 
-    # Auto-break stale locks if GnuCash is not running
-    lock_path = env_file + ".LCK"
-    if os.path.exists(lock_path):
-        if is_gnucash_running():
-            print("Error: Lock file exists and GnuCash is running. Close GnuCash first.", file=sys.stderr)
-            sys.exit(1)
-        else:
-            print("Removing stale lock file...", file=sys.stderr)
-            remove_stale_lock(env_file)
+    conn = sqlite3.connect(env_file)
+    conn.execute("PRAGMA journal_mode=WAL")
+    print("SQLite WAL mode enabled — concurrent access with GnuCash GUI is supported.", file=sys.stderr)
 
-    try:
-        if write_mode:
-            current_session = Session(env_file, SessionOpenMode.SESSION_NORMAL_OPEN)
-            print("File opened successfully (read-write).", file=sys.stderr)
-        else:
-            current_session = Session(env_file, SessionOpenMode.SESSION_READ_ONLY)
-            print("File opened successfully (read-only).", file=sys.stderr)
-    except Exception as e:
-        print(f"Error opening file: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Register read tools - these are always available
+    # Register all tools
     mcp.tool()(list_accounts)
     mcp.tool()(get_account_balance)
     mcp.tool()(get_transactions)
     mcp.tool()(search_accounts)
     mcp.tool()(get_account_info)
-
-    # Register write tools only in write mode
-    if write_mode:
-        mcp.tool(
-            description="[WRITE MODE ENABLED] Create a new transaction transferring money between two accounts. "
-            "This creates a balanced double-entry transaction with two splits. "
-            "Args: from_account (source account), to_account (destination account), "
-            "amount (positive number), description (payee), date (optional, YYYY-MM-DD), memo (optional)."
-        )(add_transaction)
-        mcp.tool(
-            description="[WRITE MODE ENABLED] Save pending changes to the GnuCash file immediately. "
-            "Changes are also auto-saved when the session ends."
-        )(commit)
+    mcp.tool()(get_account_mapping)
+    mcp.tool()(add_account_mapping)
+    mcp.tool()(create_account)
+    mcp.tool()(delete_account)
+    mcp.tool()(add_transaction)
 
     mcp.run()
 
